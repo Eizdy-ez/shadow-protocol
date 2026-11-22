@@ -1,560 +1,435 @@
-// SHADOW PROTOCOL — the game loop and state machine.
-// Screens: title -> briefing -> play -> levelComplete -> (next) briefing
-//          -> victory, or play -> failed -> retry.
-// URL hooks for testing and screenshots (deterministic, no cheats in play):
-//   ?shot=cover|alarm|hide|vault   stage a frozen scene for a screenshot
-//   ?autoplay=1&level=0            the play-test bot plays the level
-
-import { CONFIG } from './config.js';
-import { LEVELS, parseLevel, tileAt } from './levels.js';
-import { makeGuard, makeCamera, updateGuard, updateCamera, hearNoise } from './guards.js';
-import { makePlayer, updatePlayer, interactable, doInteract } from './player.js';
-import { createInput, pressed } from './input.js';
-import { drawWorld, objectivesComplete } from './render.js';
-import {
-  drawHUD,
-  drawTitle,
-  drawBriefing,
-  drawLevelComplete,
-  drawVictory,
-  drawFailed,
-  drawPaused,
-  formatTime,
-} from './hud.js';
-import { sfx, unlockAudio, toggleMute } from './audio.js';
-import { stepAutopilot } from './autopilot.js';
+// SHADOW PROTOCOL — the game itself: state machine, main loop, scoring,
+// shot staging for screenshots, autoplay wiring, and the window.__game
+// handle the play-test harness reads.
+import { VIEW_W, VIEW_H, TILE, COIN_HEAR_RADIUS, RUN_HEAR_RADIUS, CAUGHT_ALARM, CAMERA_ALARM, ALARM_MAX, CATCH_DISTANCE, ITEM_PICKUP_DISTANCE, DOG_BARK_ALERT_RADIUS, clamp, dist } from './config.js';
+import { LEVELS, parseLevel, isClosetTile, isHidingTile, tileAtPx } from './levels.js';
+import { Input } from './input.js';
+import { createPlayer, movePlayer, updatePlayerHiding, throwCoin, fireSonar, toggleCloset, sonarHeardRadius } from './player.js';
+import { Guard, Camera, Dog } from './guards.js';
+import { SoundFX } from './audio.js';
+import { renderWorld, renderTitle } from './render.js';
+import { drawHUD, drawBriefing, drawLevelComplete, drawFailed, drawComplete } from './hud.js';
+import { Autopilot } from './autopilot.js';
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-// Supersampled backing store: the game is drawn in 1280x800 logical
-// pixels, but the canvas holds 2x the pixels and the compositor downsamples
-// it, so every edge, line and letter renders sharp instead of blurry —
-// including the 1280x800 screenshots. render() scales the context to match.
-const SS = 2;
-canvas.width = CONFIG.WIDTH * SS;
-canvas.height = CONFIG.HEIGHT * SS;
 
-const input = createInput(canvas);
-
-const G = {
-  screen: 'title',
-  levelIndex: 0,
-  level: null,
-  guards: [],
-  cameras: [],
-  player: null,
-  time: 0,
-  levelTime: 0,
-  totalTime: 0,
-  score: 0,
-  detections: 0,
-  levelDetections: 0,
-  alarm: 0,
-  events: [],
-  floaters: [],
-  ripples: [],
-  toast: '',
-  toastT: 0,
-  caughtFlash: 0,
-  cameraSees: false,
-  prompt: null,
-  buttons: [],
-  frozen: false,
-  autoplay: false,
-  autopilot: { t: 0, path: null, pathI: 0, targetKey: '', waitT: 0, coinThrown: false, pushT: 0, fleeing: false, fleeTarget: null, holdTile: null },
-  lastLevelScore: null,
-  shot: null,
-};
-// Exposed for the play-test script (read-only introspection, no cheats).
-window.__game = G;
-
-function loadLevel(i) {
-  const def = LEVELS[i];
-  const level = parseLevel(def);
-  G.levelIndex = i;
-  G.level = level;
-  G.guards = level.guards.map((d) => makeGuard(d, 'guard'));
-  if (level.dog) G.guards.push(makeGuard(level.dog, 'dog'));
-  G.cameras = level.cameras.map((d) => makeCamera(d));
-  G.player = makePlayer(level.playerStart);
-  G.player.coins = def.coins;
-  G.player.sonar = 2; // Sonar Pulse charges, refilled every level.
-  G.sonar = null; // active pulse: {t, life} while the ring expands.
-  G.alarm = 0;
-  G.levelTime = 0;
-  G.levelDetections = 0;
-  G.events = [];
-  G.floaters = [];
-  G.ripples = [];
-  G.toast = '';
-  G.toastT = 0;
-  G.caughtFlash = 0;
-  G.autopilot = { t: 0, path: null, pathI: 0, targetKey: '', waitT: 0, coinThrown: false, pushT: 0, fleeing: false, fleeTarget: null, holdTile: null };
-}
-
-function throwCoin(tx, ty) {
-  const p = G.player;
-  if (!p || p.coins <= 0 || p.coinFlight) return;
-  const dx = tx - p.x;
-  const dy = ty - p.y;
-  const d = Math.hypot(dx, dy);
-  const maxRange = 340;
-  if (d > maxRange) {
-    tx = p.x + (dx / d) * maxRange;
-    ty = p.y + (dy / d) * maxRange;
+class Game {
+  constructor() {
+    const params = new URLSearchParams(location.search);
+    this.input = new Input(canvas);
+    this.sfx = new SoundFX();
+    this.screen = 'title'; // title | briefing | playing | levelComplete | failed | complete
+    this.levelIndex = Number(params.get('level') || '0') || 0;
+    this.levelIndex = clamp(this.levelIndex, 0, LEVELS.length - 1);
+    this.autoplay = params.get('autoplay') === '1';
+    this.shot = params.get('shot') || null;
+    this.score = 0;
+    this.detections = 0;
+    this.alarm = 0;
+    this.levelTime = 0;
+    this.totalTime = 0;
+    this.status = 'EXPOSED';
+    this.message = '';
+    this.messageT = 0;
+    this.floatingTexts = [];
+    this.coins = []; // thrown coins in flight / on the floor
+    this.t = 0;
+    this.bot = null;
+    this.shotStaged = false;
+    this.loadLevel(this.levelIndex);
+    if (this.autoplay) {
+      this.screen = 'playing';
+      this.bot = new Autopilot(this);
+    }
+    window.__game = this;
+    window.__shotReady = false;
+    if (this.shot) this.stageShot();
   }
-  // The coin must land somewhere a guard can actually walk to, or the
-  // guard will stand at the wall forever trying to reach it.
-  if (tileAt(G.level, tx, ty) === '#') {
-    let found = null;
-    for (let rad = 1; rad <= 4 && !found; rad++) {
-      for (let dc = -rad; dc <= rad && !found; dc++) {
-        for (let dr = -rad; dr <= rad && !found; dr++) {
-          const nx = tx + dc * CONFIG.TILE;
-          const ny = ty + dr * CONFIG.TILE;
-          if (tileAt(G.level, nx, ny) !== '#') found = { x: nx, y: ny };
+
+  loadLevel(idx) {
+    this.levelIndex = idx;
+    this.level = parseLevel(LEVELS[idx]);
+    this.player = createPlayer(this.level);
+    this.guards = this.level.guards.map((g) => new Guard(this.level, g));
+    this.cameras = this.level.cameras.map((c) => new Camera(c));
+    this.dog = this.level.dog ? new Dog(this.level, this.level.dog) : null;
+    this.coins = [];
+    this.floatingTexts = [];
+    this.levelTime = 0;
+    this.message = '';
+    this.messageT = 0;
+    this.bot = this.autoplay ? new Autopilot(this) : this.bot;
+  }
+
+  showMessage(text, seconds = 2.5) {
+    this.message = text;
+    this.messageT = seconds;
+  }
+
+  addFloat(text, x, y, color = '#fff') {
+    this.floatingTexts.push({ text, x, y, a: 1, color });
+  }
+
+  // ---- Shot staging: deterministic scenes for the 4 screenshots ----------
+  stageShot() {
+    const shot = this.shot;
+    if (shot === 'cover') {
+      this.loadLevel(0);
+      this.screen = 'playing';
+      this.player.x = 560;
+      this.player.y = 340;
+      this.player.dir = 0.4;
+      fireSonar(this.player);
+      this.coins.push({ x: 700, y: 300, t: 0.25, landed: false, sx: 560, sy: 340 });
+      this.settle(50);
+    } else if (shot === 'alarm') {
+      this.loadLevel(1);
+      this.screen = 'playing';
+      this.player.x = 640;
+      this.player.y = 200;
+      this.player.dir = Math.PI;
+      this.alarm = 30;
+      this.detections = 1;
+      const g = this.guards[1];
+      g.x = 640;
+      g.y = 320;
+      g.dir = -Math.PI / 2;
+      g.alert(this.player.x, this.player.y);
+      this.settle(30);
+    } else if (shot === 'hide') {
+      this.loadLevel(3);
+      this.screen = 'playing';
+      // Player in the tall grass at the centre of the garden.
+      this.player.x = 420;
+      this.player.y = 340;
+      this.player.dir = 0;
+      updatePlayerHiding(this.level, this.player);
+      const g = this.guards[0];
+      g.x = 480;
+      g.y = 300;
+      g.dir = Math.PI;
+      this.showMessage('Hidden in the tall grass — guards cannot see you', 999);
+      this.settle(40);
+    } else if (shot === 'vault') {
+      this.loadLevel(4);
+      this.screen = 'playing';
+      this.player.x = 480;
+      this.player.y = 120;
+      this.player.dir = Math.PI / 2;
+      this.level.items[0].taken = true;
+      this.score = 500;
+      this.settle(50);
+    }
+    this.shotStaged = true;
+    window.__shotReady = true;
+  }
+
+  // Run the simulation forward a fixed number of steps so guards are
+  // mid-patrol and the scene looks alive, deterministically.
+  settle(steps) {
+    for (let i = 0; i < steps; i++) this.updateWorld(1 / 60, true);
+  }
+
+  // ---- Events from guards/cameras/dog ------------------------------------
+  handleEvents(events) {
+    for (const e of events) {
+      if (e.type === 'spotted') {
+        this.sfx.alert();
+        this.addFloat('SPOTTED!', e.x, e.y - 34, '#ff5040');
+      } else if (e.type === 'bark') {
+        this.sfx.bark();
+        this.addFloat('WOOF!', e.x, e.y - 30, '#ffd76e');
+        for (const g of this.guards) {
+          if (dist(g.x, g.y, e.px, e.py) < DOG_BARK_ALERT_RADIUS) g.becomeSuspicious(e.px, e.py);
+        }
+      } else if (e.type === 'camera') {
+        this.alarm = Math.min(ALARM_MAX, this.alarm + CAMERA_ALARM);
+        this.addFloat(`CAMERA! +${CAMERA_ALARM} alarm`, e.x, e.y - 30, '#ff9a5a');
+        let nearest = null;
+        let nearestD = Infinity;
+        for (const g of this.guards) {
+          const d = dist(g.x, g.y, e.x, e.y);
+          if (d < nearestD) {
+            nearestD = d;
+            nearest = g;
+          }
+        }
+        if (nearest) nearest.becomeSuspicious(e.x, e.y);
+        if (this.alarm >= ALARM_MAX) this.failMission();
+      }
+    }
+  }
+
+  failMission() {
+    this.screen = 'failed';
+    this.sfx.caught();
+    this.input.clearQueue();
+  }
+
+  caught() {
+    this.detections += 1;
+    this.alarm = Math.min(ALARM_MAX, this.alarm + CAUGHT_ALARM);
+    this.sfx.caught();
+    this.addFloat(`CAUGHT! +${CAUGHT_ALARM} alarm`, this.player.x, this.player.y - 30, '#ff5040');
+    if (this.alarm >= ALARM_MAX) {
+      this.failMission();
+      return;
+    }
+    this.showMessage('Caught! Back to the start of the level.', 2.5);
+    this.loadLevel(this.levelIndex);
+  }
+
+  // ---- Per-frame world update (playing only) ------------------------------
+  updateWorld(dt, staging = false) {
+    const p = this.player;
+    const level = this.level;
+    this.levelTime += dt;
+    this.totalTime += dt;
+    if (p.sonarT > 0) p.sonarT = Math.max(0, p.sonarT - dt);
+    if (this.messageT > 0) this.messageT -= dt;
+    for (const ft of this.floatingTexts) {
+      ft.y -= 22 * dt;
+      ft.a -= 0.7 * dt;
+    }
+    this.floatingTexts = this.floatingTexts.filter((ft) => ft.a > 0);
+
+    // --- Player input ------------------------------------------------------
+    let mx = 0;
+    let my = 0;
+    let sneak = false;
+    if (this.autoplay && this.bot && !staging) {
+      const cmd = this.bot.update(dt);
+      mx = cmd.mx;
+      my = cmd.my;
+      sneak = cmd.sneak;
+    } else if (!staging) {
+      const v = this.input.moveVector();
+      mx = v.x;
+      my = v.y;
+      sneak = this.input.down('ShiftLeft', 'ShiftRight');
+    }
+    const moved = movePlayer(level, p, mx, my, dt, sneak);
+    if (moved && !staging) {
+      p.stepT -= dt * (sneak ? 1 : 1.9);
+      if (p.stepT <= 0) {
+        p.stepT = 0.42;
+        this.sfx.step(sneak);
+        if (!sneak) {
+          // Running is heard by nearby guards.
+          for (const g of this.guards) g.hear(p.x, p.y, RUN_HEAR_RADIUS);
+          if (this.dog) this.dogHear(p.x, p.y, RUN_HEAR_RADIUS);
         }
       }
     }
-    if (found) {
-      tx = found.x;
-      ty = found.y;
+    updatePlayerHiding(level, p);
+    if (p.inCloset) {
+      // Inside a closet the player cannot move.
+      p.moving = false;
     }
-  }
-  p.coins--;
-  p.coinFlight = { sx: p.x, sy: p.y, x: p.x, y: p.y, tx, ty, t: 0 };
-  sfx.coinThrow();
-}
-G.throwCoin = throwCoin;
 
-// --- Sonar Pulse (original mechanic) --------------------------------------
-// Q spends one charge: a pulse expands from the player and, while it lasts,
-// reveals where every guard is heading (their next waypoint, or the point
-// they are investigating) through the walls. The trade-off: the pulse is
-// audible — guards close to the player hear it and come to look.
-function fireSonar() {
-  const p = G.player;
-  if (!p || p.sonar <= 0 || G.sonar) return;
-  p.sonar--;
-  G.sonar = { t: 0, life: 1.6 };
-  sfx.sonar();
-  hearNoise(G.guards, p.x, p.y, 150, G);
-  toast('Sonar pulse — every patrol route revealed, but nearby guards heard it');
-}
-G.fireSonar = fireSonar;
-
-function addFloater(x, y, text, color) {
-  G.floaters.push({ x, y, text, color, t: 0, life: 1.6 });
-}
-
-function toast(text) {
-  G.toast = text;
-  G.toastT = 3;
-}
-
-function handleCaught(kind) {
-  G.detections++;
-  G.levelDetections++;
-  G.alarm = Math.min(100, G.alarm + CONFIG.ALARM_CAUGHT);
-  G.caughtFlash = 1.4;
-  sfx.caught();
-  if (kind === 'dog') sfx.bark();
-  addFloater(G.player.x, G.player.y - 30, 'CAUGHT!', '#ff5d5d');
-  if (G.alarm >= 100) {
-    G.screen = 'failed';
-    return;
-  }
-  // Restart from the level checkpoint (the start), guards reset to patrol.
-  toast('Spotted! The alarm rises — back to the start.');
-  G.player.x = G.level.playerStart.x;
-  G.player.y = G.level.playerStart.y;
-  G.player.inCloset = false;
-  G.player.coinFlight = null;
-  G.guards = G.level.guards.map((d) => makeGuard(d, 'guard'));
-  if (G.level.dog) G.guards.push(makeGuard(G.level.dog, 'dog'));
-}
-
-function completeLevel() {
-  const lv = G.level;
-  const timeBonus = Math.max(0, Math.round(lv.par - G.levelTime)) * CONFIG.TIME_BONUS_PER_SEC;
-  const coinBonus = G.player.coins * CONFIG.COIN_BONUS;
-  const penalty = G.levelDetections * CONFIG.DETECTION_PENALTY;
-  const levelScore = CONFIG.LEVEL_BASE_SCORE + timeBonus + coinBonus - penalty;
-  G.score += levelScore;
-  G.lastLevelScore = {
-    score: levelScore,
-    time: G.levelTime,
-    detections: G.levelDetections,
-    coins: G.player.coins,
-  };
-  sfx.success();
-  G.screen = 'levelComplete';
-}
-
-function processEvents() {
-  for (const e of G.events) {
-    switch (e.type) {
-      case 'playerNoise':
-        // Running is audible — and now visible: a faint expanding ring.
-        G.ripples.push({ x: e.x, y: e.y, r: 6, t: 0, life: 0.55, faint: true, maxR: 55 });
-        hearNoise(G.guards, e.x, e.y, e.radius, G);
-        break;
-      case 'coinLanded':
-        G.ripples.push({ x: e.x, y: e.y, r: 6, t: 0, life: 0.7 });
-        hearNoise(G.guards, e.x, e.y, e.radius, G);
-        sfx.coinLand();
-        break;
-      case 'caught':
-        handleCaught(e.kind);
-        break;
-      case 'spotted':
-        sfx.spotted();
-        addFloater(e.x, e.y - 30, 'SPOTTED!', '#ff5d5d');
-        break;
-      case 'bark':
-        sfx.bark();
-        addFloater(e.x, e.y - 30, 'WOOF!', '#ffb347');
-        break;
-      case 'suspicious':
-        sfx.suspicious();
-        break;
-      case 'guardStep':
-        sfx.guardStep(e.dist);
-        break;
-      case 'playerStep':
-        sfx.step(G.player.running);
-        break;
-      case 'cameraBeep':
-        sfx.cameraBeep();
-        break;
-      case 'pickup':
-        sfx.pickup();
-        toast(e.label);
-        break;
-      case 'hide':
-        sfx.hide();
-        toast('Hidden — guards cannot see you here.');
-        break;
-      case 'unhide':
-        sfx.click();
-        break;
-      case 'noiseHeard':
-        break;
+    if (!staging) {
+      // E: hide in / leave a closet.
+      if (this.input.pressed('KeyE')) {
+        if (toggleCloset(level, p)) {
+          this.sfx.click();
+          this.showMessage(p.inCloset ? 'Hidden in the closet — press E to slip out' : 'You slip out of the closet', 2);
+        }
+      }
+      // Q: sonar pulse.
+      if (this.input.pressed('KeyQ')) {
+        if (fireSonar(p)) {
+          this.sfx.sonar();
+          for (const g of this.guards) g.hear(p.x, p.y, sonarHeardRadius());
+          if (this.dog) this.dogHear(p.x, p.y, sonarHeardRadius());
+          this.showMessage('Sonar pulse — guard routes revealed, but they heard it', 2.5);
+        } else {
+          this.showMessage('No sonar charges left', 1.5);
+        }
+      }
+      // Click: throw a distraction coin.
+      const click = this.input.consumeClick();
+      if (click) {
+        const coin = throwCoin(level, p, click.x, click.y);
+        if (coin) {
+          this.coins.push(coin);
+          this.sfx.coin();
+        } else {
+          this.showMessage('Out of coins', 1.2);
+        }
+      }
     }
-  }
-  G.events = [];
-}
 
-function updatePlay(dt) {
-  const p = G.player;
+    // Thrown coins fly, land, and draw guards in.
+    for (const coin of this.coins) {
+      if (!coin.landed) {
+        coin.t += dt * 2.2;
+        if (coin.t >= 1) {
+          coin.landed = true;
+          coin.t = 1;
+          this.sfx.coinLand();
+          for (const g of this.guards) g.hear(coin.x, coin.y, COIN_HEAR_RADIUS);
+          if (this.dog) this.dogHear(coin.x, coin.y, COIN_HEAR_RADIUS);
+        }
+      }
+    }
 
-  // Pause / mute
-  if (pressed(input, 'KeyP') || pressed(input, 'Escape')) {
-    G.screen = 'paused';
-    return;
-  }
-  if (pressed(input, 'KeyM')) {
-    const m = toggleMute();
-    toast(m ? 'Sound muted' : 'Sound on');
-  }
+    // --- Guards, cameras, dog ----------------------------------------------
+    const events = [];
+    for (const g of this.guards) g.update(level, p, dt, events);
+    for (const cam of this.cameras) cam.update(level, p, dt, events);
+    if (this.dog) this.dog.update(level, p, dt, events);
+    if (!staging) this.handleEvents(events);
 
-  // Autopilot drives the same input the player uses.
-  if (G.autoplay) {
-    input.keys.delete('KeyW');
-    input.keys.delete('KeyA');
-    input.keys.delete('KeyS');
-    input.keys.delete('KeyD');
-    input.keys.delete('ShiftLeft');
-    stepAutopilot(G, dt, input);
-  }
-
-  // Interact
-  if (pressed(input, 'KeyE')) {
-    const what = interactable(p, G.level);
-    if (what) doInteract(p, G.level, G, what);
-  }
-
-  // Sonar Pulse (Q)
-  if (pressed(input, 'KeyQ')) fireSonar();
-
-  // Throw a coin where the player clicked (not on the HUD bar).
-  while (input.clicks.length) {
-    const c = input.clicks.shift();
-    if (c.y > 60) throwCoin(c.x, c.y);
-  }
-
-  updatePlayer(p, input, dt, G.level, G);
-  G.cameraSees = false;
-  for (const g of G.guards) updateGuard(g, dt, G.level, p, G);
-  for (const cam of G.cameras) updateCamera(cam, dt, G.level, p, G);
-  processEvents();
-
-  // Alarm: climbs while chased or seen by a camera, slowly falls when calm.
-  const anyAlerted = G.guards.some((g) => g.state === 'alerted');
-  if (anyAlerted) G.alarm = Math.min(100, G.alarm + CONFIG.ALARM_ALERT_RATE * dt);
-  if (G.cameraSees) G.alarm = Math.min(100, G.alarm + CONFIG.ALARM_CAMERA_RATE * dt);
-  if (!anyAlerted && !G.cameraSees) G.alarm = Math.max(0, G.alarm - CONFIG.ALARM_DECAY * dt);
-  if (G.alarm >= 100) {
-    G.screen = 'failed';
-    return;
-  }
-
-  // Prompt
-  const what = interactable(p, G.level);
-  const onGrass = tileAt(G.level, p.x, p.y) === 'G';
-  G.prompt = what
-    ? `Press E — ${what.label}`
-    : onGrass
-      ? 'Hidden in the tall grass — guards cannot see you'
-      : p.hidden
-        ? 'Hidden — hold still, let the patrol pass'
-        : null;
-
-  // Visibility status for the HUD — SEEN / HIDDEN / SHADOW / EXPOSED, so
-  // the player reads at a glance whether they are safe right now.
-  G.visibility = anyAlerted || G.cameraSees
-    ? 'SEEN'
-    : p.hidden
-      ? 'HIDDEN'
-      : tileAt(G.level, p.x, p.y) === 'S'
-        ? 'SHADOW'
-        : 'EXPOSED';
-
-  // Timers and effects
-  G.levelTime += dt;
-  G.totalTime += dt;
-  if (G.toastT > 0) G.toastT -= dt;
-  if (G.caughtFlash > 0) G.caughtFlash -= dt;
-  for (const f of G.floaters) f.t += dt;
-  G.floaters = G.floaters.filter((f) => f.t < f.life);
-  for (const r of G.ripples) {
-    r.t += dt;
-    r.r = 6 + (r.t / r.life) * (r.maxR || 90);
-  }
-  G.ripples = G.ripples.filter((r) => r.t < r.life);
-  if (G.sonar) {
-    G.sonar.t += dt;
-    if (G.sonar.t >= G.sonar.life) G.sonar = null;
-  }
-
-  // Exit: only when the objectives are done.
-  if (objectivesComplete(G)) {
-    const d = Math.hypot(p.x - G.level.exit.x, p.y - G.level.exit.y);
-    if (d < 34) completeLevel();
-  }
-}
-
-function handleMenuClick() {
-  while (input.clicks.length) {
-    const c = input.clicks.shift();
-    unlockAudio();
-    for (const b of G.buttons) {
-      if (c.x >= b.x && c.x <= b.x + b.w && c.y >= b.y && c.y <= b.y + b.h) {
-        sfx.click();
-        doAction(b.action);
+    // --- Caught? -------------------------------------------------------------
+    if (!staging) {
+      for (const g of this.guards) {
+        if (g.state === 'alerted' && dist(g.x, g.y, p.x, p.y) < CATCH_DISTANCE) {
+          this.caught();
+          return;
+        }
+      }
+      if (this.dog && this.dog.state === 'alerted' && dist(this.dog.x, this.dog.y, p.x, p.y) < CATCH_DISTANCE) {
+        this.caught();
         return;
       }
     }
-  }
-}
 
-function doAction(action) {
-  // A screen change eats any key pressed on the old screen, so a stale tap
-  // (e.g. Q on the title) can never fire on the new one.
-  input.pressedQueue.clear();
-  if (action.startsWith('level:')) {
-    loadLevel(Number(action.split(':')[1]));
-    G.screen = 'briefing';
-  } else if (action === 'begin') {
-    G.screen = 'play';
-  } else if (action === 'next') {
-    loadLevel(G.levelIndex + 1);
-    G.screen = 'briefing';
-  } else if (action === 'victory') {
-    G.screen = 'victory';
-  } else if (action === 'restart') {
-    G.score = 0;
-    G.detections = 0;
-    G.totalTime = 0;
-    loadLevel(0);
-    G.screen = 'title';
-  } else if (action === 'retry') {
-    loadLevel(G.levelIndex);
-    G.screen = 'play';
-  }
-}
-
-function updateMenu(dt) {
-  if (G.screen === 'title') {
-    // Attract mode: the museum patrols behind the menu.
-    for (const g of G.guards) updateGuard(g, dt, G.level, { x: -9999, y: -9999, hidden: false, sneaking: false }, G);
-    G.events = [];
-    if (pressed(input, 'Digit1')) doAction('level:0');
-    if (pressed(input, 'Digit2')) doAction('level:1');
-    if (pressed(input, 'Digit3')) doAction('level:2');
-    if (pressed(input, 'Digit4')) doAction('level:3');
-    if (pressed(input, 'Digit5')) doAction('level:4');
-    handleMenuClick();
-  } else if (G.screen === 'briefing') {
-    if (pressed(input, 'Enter') || pressed(input, 'Space')) doAction('begin');
-    handleMenuClick();
-  } else if (G.screen === 'levelComplete') {
-    if (pressed(input, 'Enter')) doAction(G.levelIndex < 4 ? 'next' : 'victory');
-    handleMenuClick();
-    // Autopilot play-test: keep going into the next level by itself.
-    if (G.autoplay) {
-      G.autoplayT = (G.autoplayT || 0) + dt;
-      if (G.autoplayT > 1) {
-        G.autoplayT = 0;
-        doAction(G.levelIndex < 4 ? 'next' : 'victory');
-        if (G.screen === 'briefing') G.screen = 'play';
+    // --- Items and exit ---------------------------------------------------------
+    for (const item of level.items) {
+      if (!item.taken && dist(p.x, p.y, item.x, item.y) < ITEM_PICKUP_DISTANCE) {
+        item.taken = true;
+        this.score += 500;
+        this.sfx.pickup();
+        this.addFloat(`+500  ${level.itemLabel}`, item.x, item.y - 24, '#ffd76e');
       }
     }
-  } else if (G.screen === 'victory') {
-    if (pressed(input, 'Enter')) doAction('restart');
-    handleMenuClick();
-  } else if (G.screen === 'failed') {
-    if (pressed(input, 'KeyR') || pressed(input, 'Enter')) doAction('retry');
-    handleMenuClick();
-  } else if (G.screen === 'paused') {
-    if (pressed(input, 'KeyP') || pressed(input, 'Escape')) G.screen = 'play';
-    input.clicks.length = 0;
+    const allTaken = level.items.every((it) => it.taken);
+    const exit = level.exit;
+    if (Math.floor(p.x / TILE) === exit.c && Math.floor(p.y / TILE) === exit.r) {
+      if (allTaken) {
+        const bonus = 300 + Math.max(0, 300 - Math.floor(this.levelTime * 2));
+        this.score += bonus;
+        this.sfx.complete();
+        this.screen = 'levelComplete';
+        this.input.clearQueue();
+        return;
+      }
+      if (!staging) this.showMessage(`Collect all ${level.items.length} ${level.itemLabel.toLowerCase()}s first`, 1.2);
+    }
+
+    // --- Visibility status --------------------------------------------------------
+    this.updateStatus();
+  }
+
+  dogHear(x, y, radius) {
+    if (!this.dog) return;
+    if (dist(this.dog.x, this.dog.y, x, y) > radius) return;
+    this.dog.state = 'alerted';
+    this.dog.lastSeen = { x, y };
+    this.dog.loseT = 0;
+  }
+
+  updateStatus() {
+    const p = this.player;
+    let seen = false;
+    for (const g of this.guards) {
+      if (g.state === 'alerted' && g.loseT < 1) { seen = true; break; }
+    }
+    if (this.dog && this.dog.state === 'alerted') seen = true;
+    // Also seen when any guard's suspicion is nearly full.
+    if (!seen) {
+      for (const g of this.guards) {
+        if (g.suspicion > 0.85) { seen = true; break; }
+      }
+    }
+    if (seen) this.status = 'SEEN';
+    else if (p.hidden) this.status = 'HIDDEN';
+    else {
+      // In lamplight or in the dark?
+      let lit = false;
+      for (const lamp of this.level.lamps) {
+        if (dist(p.x, p.y, lamp.x, lamp.y) < 110) { lit = true; break; }
+      }
+      this.status = lit ? 'EXPOSED' : 'SHADOW';
+    }
+  }
+
+  // ---- Frame ----------------------------------------------------------------
+  frame(now) {
+    const dt = Math.min(0.05, (now - (this.lastNow || now)) / 1000 || 0.016);
+    this.lastNow = now;
+    this.t += dt;
+    this.sfx.ensure();
+
+    if (this.screen === 'title') {
+      if (this.input.pressed('Enter', 'NumpadEnter')) {
+        this.screen = 'briefing';
+        this.input.clearQueue();
+        this.sfx.click();
+      } else {
+        for (let i = 0; i < 5; i++) {
+          if (this.input.pressed('Digit' + (i + 1), 'Numpad' + (i + 1))) {
+            this.loadLevel(i);
+            this.screen = 'briefing';
+            this.input.clearQueue();
+            this.sfx.click();
+            break;
+          }
+        }
+      }
+    } else if (this.screen === 'briefing') {
+      if (this.input.pressed('Enter', 'NumpadEnter')) {
+        this.screen = 'playing';
+        this.input.clearQueue();
+        this.sfx.click();
+      }
+    } else if (this.screen === 'playing') {
+      this.updateWorld(dt);
+    } else if (this.screen === 'levelComplete') {
+      if (this.input.pressed('Enter', 'NumpadEnter')) {
+        this.input.clearQueue();
+        if (this.levelIndex + 1 < LEVELS.length) {
+          this.loadLevel(this.levelIndex + 1);
+          this.screen = 'briefing';
+        } else {
+          this.screen = 'complete';
+        }
+      }
+    } else if (this.screen === 'failed') {
+      if (this.input.pressed('Enter', 'NumpadEnter')) {
+        this.input.clearQueue();
+        this.loadLevel(this.levelIndex);
+        this.screen = 'briefing';
+      }
+    } else if (this.screen === 'complete') {
+      if (this.input.pressed('Enter', 'NumpadEnter')) {
+        this.input.clearQueue();
+        this.score = 0;
+        this.detections = 0;
+        this.alarm = 0;
+        this.loadLevel(0);
+        this.screen = 'title';
+      }
+    }
+
+    // ---- Draw -----------------------------------------------------------------
+    if (this.screen === 'title') {
+      renderTitle(ctx, this.t);
+    } else {
+      renderWorld(ctx, this, this.t);
+      if (this.screen === 'playing' || this.screen === 'levelComplete' || this.screen === 'failed') {
+        drawHUD(ctx, this);
+      }
+      if (this.screen === 'briefing') drawBriefing(ctx, this);
+      else if (this.screen === 'levelComplete') drawLevelComplete(ctx, this);
+      else if (this.screen === 'failed') drawFailed(ctx, this);
+      else if (this.screen === 'complete') drawComplete(ctx, this);
+    }
+
+    requestAnimationFrame((n) => this.frame(n));
   }
 }
 
-function render() {
-  ctx.setTransform(SS, 0, 0, SS, 0, 0);
-  ctx.clearRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
-  if (G.screen === 'title') {
-    drawWorld(ctx, G);
-    G.buttons = drawTitle(ctx, G, LEVELS);
-  } else if (G.screen === 'briefing') {
-    drawWorld(ctx, G);
-    G.buttons = drawBriefing(ctx, G);
-  } else if (G.screen === 'play' || G.screen === 'paused') {
-    drawWorld(ctx, G);
-    drawHUD(ctx, G);
-    if (G.screen === 'paused') drawPaused(ctx);
-    G.buttons = [];
-  } else if (G.screen === 'levelComplete') {
-    drawWorld(ctx, G);
-    G.buttons = drawLevelComplete(ctx, G);
-  } else if (G.screen === 'victory') {
-    drawWorld(ctx, G);
-    G.buttons = drawVictory(ctx, G);
-  } else if (G.screen === 'failed') {
-    drawWorld(ctx, G);
-    G.buttons = drawFailed(ctx, G);
-  }
-}
-
-// --- staged screenshots: frozen, deterministic scenes -------------------
-function stageShot(name) {
-  G.shot = name;
-  G.frozen = true;
-  G.time = 3.0; // fixed, so the bobbing and glow never move between runs
-  if (name === 'cover') {
-    loadLevel(0);
-    G.player.x = 7 * CONFIG.TILE + 20;
-    G.player.y = 2 * CONFIG.TILE + 20;
-    G.player.hidden = true;
-    const g0 = G.guards[0];
-    g0.x = 6 * CONFIG.TILE + 20;
-    g0.y = 4 * CONFIG.TILE + 20;
-    g0.dir = Math.atan2(G.player.y - g0.y, G.player.x - g0.x);
-    const g1 = G.guards[1];
-    g1.x = 22 * CONFIG.TILE + 20;
-    g1.y = 3 * CONFIG.TILE + 20;
-    g1.dir = Math.PI * 0.75;
-    // Sonar Pulse mid-flight: the ring is expanding from the player and the
-    // guards' destinations are revealed — the game's original mechanic.
-    G.sonar = { t: 0.55, life: 1.6 };
-    G.player.sonar = 1;
-    g0.target = { x: 9 * CONFIG.TILE + 20, y: 4 * CONFIG.TILE + 20 };
-    G.screen = 'play';
-  } else if (name === 'alarm') {
-    loadLevel(1);
-    G.player.x = 12 * CONFIG.TILE + 20;
-    G.player.y = 5 * CONFIG.TILE + 20;
-    const g0 = G.guards[0];
-    g0.x = 10 * CONFIG.TILE + 20;
-    g0.y = 5 * CONFIG.TILE + 20;
-    g0.dir = 0;
-    g0.state = 'alerted';
-    g0.meter = 1;
-    g0.lastSeen = { x: G.player.x, y: G.player.y };
-    G.alarm = 55;
-    G.score = 1240;
-    G.levelTime = 74;
-    // A distraction coin mid-flight past the guard, and the ring where the
-    // last one landed: the coin is the mechanic that buys this escape.
-    G.player.coins = 2;
-    G.player.coinFlight = {
-      sx: G.player.x, sy: G.player.y,
-      x: 9 * CONFIG.TILE + 20, y: 5 * CONFIG.TILE + 20,
-      tx: 7 * CONFIG.TILE + 20, ty: 5 * CONFIG.TILE + 20, t: 0.4,
-    };
-    G.ripples.push({ x: 7 * CONFIG.TILE + 20, y: 5 * CONFIG.TILE + 20, r: 40, t: 0.35, life: 0.7 });
-    G.screen = 'play';
-  } else if (name === 'hide') {
-    loadLevel(0);
-    // The player hides in the tall grass (patch at cols 10-12, rows 6-7)
-    // while a guard walks the patrol line right beside it.
-    G.player.x = 11 * CONFIG.TILE + 20;
-    G.player.y = 7 * CONFIG.TILE + 20;
-    G.player.hidden = true;
-    const g0 = G.guards[0];
-    g0.x = 9 * CONFIG.TILE + 20;
-    g0.y = 7 * CONFIG.TILE + 20;
-    g0.dir = Math.PI / 2;
-    g0.nearPlayer = true;
-    G.prompt = 'Hidden in the tall grass — guards cannot see you';
-    G.screen = 'play';
-  } else if (name === 'vault') {
-    loadLevel(4);
-    for (const item of G.level.items) item.taken = true;
-    G.player.x = 27 * CONFIG.TILE + 20;
-    G.player.y = 17 * CONFIG.TILE + 20;
-    G.player.dir = Math.PI;
-    G.score = 2450;
-    G.levelTime = 187;
-    G.detections = 1;
-    G.levelDetections = 1;
-    G.alarm = 12;
-    G.toast = 'All jewels secured — reach the exit';
-    G.toastT = 99;
-    const g = G.guards[2];
-    g.x = 8 * CONFIG.TILE + 20;
-    g.y = 10 * CONFIG.TILE + 20;
-    g.dir = Math.PI;
-    G.screen = 'play';
-  }
-  render();
-  window.__shotReady = true;
-}
-
-// --- boot ---------------------------------------------------------------
-const params = new URLSearchParams(location.search);
-loadLevel(0);
-if (params.get('shot')) {
-  stageShot(params.get('shot'));
-} else if (params.get('autoplay') === '1') {
-  G.autoplay = true;
-  const lv = Number(params.get('level') || '0');
-  loadLevel(lv);
-  G.screen = 'play';
-}
-
-let last = performance.now();
-function frame(now) {
-  const dt = Math.min(0.05, (now - last) / 1000);
-  last = now;
-  if (!G.frozen) {
-    G.time += dt;
-    if (G.screen === 'play') updatePlay(dt);
-    else updateMenu(dt);
-  }
-  render();
-  requestAnimationFrame(frame);
-}
-requestAnimationFrame(frame);
+const game = new Game();
+requestAnimationFrame((n) => game.frame(n));

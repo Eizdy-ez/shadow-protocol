@@ -1,185 +1,135 @@
-// SHADOW PROTOCOL — the player: movement, sneaking, noise, hiding,
-// distraction coins and interaction (E).
-import { CONFIG } from './config.js';
-import { isWallTile, tileAt } from './levels.js';
+// SHADOW PROTOCOL — the player: movement, collision, hiding, sonar, coins.
+import {
+  TILE, PLAYER_RADIUS, PLAYER_RUN_SPEED, PLAYER_SNEAK_SPEED,
+  SONAR_CHARGES, COINS_PER_LEVEL, SONAR_HEAR_RADIUS, clamp,
+} from './config.js';
+import { isWallTile, isHidingTile, isClosetTile, nearestWalkable } from './levels.js';
 
-export function makePlayer(start) {
+export function createPlayer(level) {
   return {
-    x: start.x,
-    y: start.y,
-    r: 13,
-    dir: 0, // facing angle
+    x: level.playerStart.x,
+    y: level.playerStart.y,
+    r: PLAYER_RADIUS,
+    dir: 0, // facing angle, radians
     moving: false,
     sneaking: false,
-    running: false,
-    hidden: false, // inside a bush / shadow / closet
+    hidden: false,
     inCloset: false,
-    noiseT: 0,
+    coins: COINS_PER_LEVEL,
+    sonarCharges: SONAR_CHARGES,
+    sonarT: 0, // seconds left of the sonar reveal
+    noiseRings: [], // {x, y, r, a} expanding rings while running
+    ringT: 0,
     stepT: 0,
-    coins: 3,
-    coinFlight: null, // {x, y, tx, ty, t} while a coin is in the air
+    movingSound: false,
   };
 }
 
-// Circle-vs-wall collision with sliding, so the player never sticks.
-// A proper circle-vs-tile test (closest point on the tile rectangle) is
-// used instead of sampling points around the circle: sampling points
-// reports a collision when the circle only grazes a wall corner, which
-// wedged the player against corridor walls a few pixels off-centre.
-function circleHitsWall(p, x, y, level) {
+// Circle-vs-tile collision: for each solid tile near the circle, find the
+// closest point on the tile rectangle and push the circle out. This is the
+// only correct way to collide a circle with a tile grid — sampling points
+// around the circle snags on wall corners.
+export function collideCircle(level, p) {
   const r = p.r;
-  const T = CONFIG.TILE;
-  const c0 = Math.floor((x - r) / T);
-  const c1 = Math.floor((x + r) / T);
-  const r0 = Math.floor((y - r) / T);
-  const r1 = Math.floor((y + r) / T);
-  for (let rr = r0; rr <= r1; rr++) {
-    for (let cc = c0; cc <= c1; cc++) {
-      if (!isWallTile(level, cc, rr)) continue;
-      const closestX = Math.max(cc * T, Math.min(x, cc * T + T));
-      const closestY = Math.max(rr * T, Math.min(y, rr * T + T));
-      const dx = x - closestX;
-      const dy = y - closestY;
-      if (dx * dx + dy * dy < r * r) return true;
-    }
-  }
-  return false;
-}
-
-function tryMove(p, nx, ny, level) {
-  if (circleHitsWall(p, nx, ny, level)) return false;
-  p.x = nx;
-  p.y = ny;
-  return true;
-}
-
-export function updatePlayer(p, input, dt, level, game) {
-  if (p.inCloset) {
-    p.moving = false;
-    p.hidden = true;
-    return;
-  }
-
-  let mx = 0;
-  let my = 0;
-  if (input.keys.has('KeyW') || input.keys.has('ArrowUp')) my -= 1;
-  if (input.keys.has('KeyS') || input.keys.has('ArrowDown')) my += 1;
-  if (input.keys.has('KeyA') || input.keys.has('ArrowLeft')) mx -= 1;
-  if (input.keys.has('KeyD') || input.keys.has('ArrowRight')) mx += 1;
-
-  p.sneaking = input.keys.has('ShiftLeft') || input.keys.has('ShiftRight');
-  const speed = p.sneaking ? CONFIG.PLAYER_SNEAK : CONFIG.PLAYER_RUN;
-  p.moving = mx !== 0 || my !== 0;
-  p.running = p.moving && !p.sneaking;
-
-  if (p.moving) {
-    const len = Math.hypot(mx, my);
-    mx /= len;
-    my /= len;
-    p.dir = Math.atan2(my, mx);
-    const step = speed * dt;
-    // Move axis by axis so walls slide instead of blocking diagonally.
-    if (!tryMove(p, p.x + mx * step, p.y, level)) {
-      // blocked on x, still try y
-    }
-    tryMove(p, p.x, p.y + my * step, level);
-  }
-
-  // Hiding: shadows, bushes and tall grass hide the player automatically.
-  const tile = tileAt(level, p.x, p.y);
-  p.hidden = tile === 'S' || tile === 'B' || tile === 'G';
-
-  // Running is loud: regular noise pulses guards can hear.
-  if (p.running) {
-    p.noiseT -= dt;
-    if (p.noiseT <= 0) {
-      p.noiseT = CONFIG.NOISE_PULSE_EVERY;
-      game.events.push({ type: 'playerNoise', x: p.x, y: p.y, radius: CONFIG.NOISE_RUN_RADIUS });
-    }
-    p.stepT -= dt;
-    if (p.stepT <= 0) {
-      p.stepT = 0.32;
-      game.events.push({ type: 'playerStep' });
-    }
-  }
-
-  // A thrown coin flies to its target, then clinks and draws guards in.
-  if (p.coinFlight) {
-    const c = p.coinFlight;
-    c.t += dt * 2.2;
-    if (c.t >= 1) {
-      p.coinFlight = null;
-      game.events.push({ type: 'coinLanded', x: c.tx, y: c.ty, radius: CONFIG.NOISE_COIN_RADIUS });
-    } else {
-      c.x = c.sx + (c.tx - c.sx) * c.t;
-      c.y = c.sy + (c.ty - c.sy) * c.t;
-    }
-  }
-}
-
-// The nearest thing E can do right now, or null.
-export function interactable(p, level) {
-  if (p.inCloset) return { kind: 'closetExit', label: 'Step out of the closet' };
-  let best = null;
-  let bestD = CONFIG.INTERACT_RADIUS;
-  for (const item of level.items) {
-    if (item.taken) continue;
-    if (item.kind === 'vault' && !level.hasKeycard) continue;
-    const d = Math.hypot(item.x - p.x, item.y - p.y);
-    if (d < bestD) {
-      bestD = d;
-      best = {
-        kind: item.kind,
-        label:
-          item.kind === 'keycard'
-            ? 'Take the keycard'
-            : item.kind === 'vault'
-              ? 'Open the safe'
-              : 'Take the ' + (item.id === '1' ? 'artifact' : item.id === '2' ? 'artifact' : 'document'),
-        item,
-      };
-    }
-  }
-  if (!best) {
-    const tile = tileAt(level, p.x, p.y);
-    if (tile === 'C') return { kind: 'closet', label: 'Hide in the closet' };
-    // Closet next to the player also counts.
-    for (const key of level.closets) {
-      const [c, r] = key.split(',').map(Number);
-      const cx = c * CONFIG.TILE + CONFIG.TILE / 2;
-      const cy = r * CONFIG.TILE + CONFIG.TILE / 2;
-      if (Math.hypot(cx - p.x, cy - p.y) < CONFIG.INTERACT_RADIUS) {
-        return { kind: 'closet', label: 'Hide in the closet' };
+  const c0 = Math.floor((p.x - r) / TILE);
+  const c1 = Math.floor((p.x + r) / TILE);
+  const r0 = Math.floor((p.y - r) / TILE);
+  const r1 = Math.floor((p.y + r) / TILE);
+  for (let tr = r0; tr <= r1; tr++) {
+    for (let tc = c0; tc <= c1; tc++) {
+      if (!isWallTile(level, tc, tr)) continue;
+      const nearestX = clamp(p.x, tc * TILE, tc * TILE + TILE);
+      const nearestY = clamp(p.y, tr * TILE, tr * TILE + TILE);
+      const dx = p.x - nearestX;
+      const dy = p.y - nearestY;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= r * r) continue;
+      if (d2 > 0.0001) {
+        const d = Math.sqrt(d2);
+        p.x = nearestX + (dx / d) * r;
+        p.y = nearestY + (dy / d) * r;
+      } else {
+        // Centre inside the tile: push out along the smallest penetration.
+        const left = p.x - tc * TILE;
+        const right = tc * TILE + TILE - p.x;
+        const top = p.y - tr * TILE;
+        const bottom = tr * TILE + TILE - p.y;
+        const m = Math.min(left, right, top, bottom);
+        if (m === left) p.x = tc * TILE - r;
+        else if (m === right) p.x = tc * TILE + TILE + r;
+        else if (m === top) p.y = tr * TILE - r;
+        else p.y = tr * TILE + TILE + r;
       }
     }
   }
-  return best;
 }
 
-export function doInteract(p, level, game, what) {
-  if (!what) return;
-  if (what.kind === 'closet') {
-    p.inCloset = true;
+// Move the player by (mx, my) — a unit vector — for dt seconds.
+// Returns true when the player actually moved.
+export function movePlayer(level, p, mx, my, dt, sneaking) {
+  if (mx === 0 && my === 0) {
+    p.moving = false;
+    p.sneaking = false;
+    return false;
+  }
+  const speed = sneaking ? PLAYER_SNEAK_SPEED : PLAYER_RUN_SPEED;
+  p.x += mx * speed * dt;
+  p.y += my * speed * dt;
+  collideCircle(level, p);
+  p.dir = Math.atan2(my, mx);
+  p.moving = true;
+  p.sneaking = sneaking;
+  // Running is audible: leave expanding noise rings behind.
+  if (!sneaking) {
+    p.ringT -= dt;
+    if (p.ringT <= 0) {
+      p.noiseRings.push({ x: p.x, y: p.y, r: 6, a: 0.5 });
+      p.ringT = 0.28;
+    }
+  }
+  for (const ring of p.noiseRings) {
+    ring.r += 130 * dt;
+    ring.a -= 0.9 * dt;
+  }
+  p.noiseRings = p.noiseRings.filter((ring) => ring.a > 0);
+  return true;
+}
+
+export function updatePlayerHiding(level, p) {
+  if (p.inCloset) {
     p.hidden = true;
-    game.events.push({ type: 'hide' });
     return;
   }
-  if (what.kind === 'closetExit') {
-    p.inCloset = false;
-    p.hidden = false;
-    game.events.push({ type: 'unhide' });
-    return;
-  }
-  const item = what.item;
-  if (!item) return;
-  item.taken = true;
-  if (item.kind === 'keycard') {
-    level.hasKeycard = true;
-    game.events.push({ type: 'pickup', label: 'Keycard acquired — the safe can be opened' });
-  } else if (item.kind === 'vault') {
-    level.vaultOpen = true;
-    game.events.push({ type: 'pickup', label: 'Safe opened — the contents are yours' });
-  } else {
-    game.events.push({ type: 'pickup', label: 'Item secured' });
-  }
+  p.hidden = isHidingTile(level, p.x, p.y);
+}
+
+// Throw a coin at pixel (x, y). The coin is nudged to the nearest walkable
+// tile so it never lands inside a wall. Returns the coin or null.
+export function throwCoin(level, p, x, y) {
+  if (p.coins <= 0) return null;
+  let c = Math.floor(x / TILE);
+  let r = Math.floor(y / TILE);
+  [c, r] = nearestWalkable(level, c, r);
+  p.coins -= 1;
+  return { x: c * TILE + TILE / 2, y: r * TILE + TILE / 2, t: 0, landed: false, sx: p.x, sy: p.y };
+}
+
+// Fire a sonar pulse. Returns true when a charge was spent.
+export function fireSonar(p) {
+  if (p.sonarCharges <= 0) return false;
+  p.sonarCharges -= 1;
+  p.sonarT = 3.5;
+  return true;
+}
+
+export function sonarHeardRadius() {
+  return SONAR_HEAR_RADIUS;
+}
+
+// Toggle hiding in a closet when the player stands on one (E key).
+export function toggleCloset(level, p) {
+  if (!isClosetTile(level, p.x, p.y)) return false;
+  p.inCloset = !p.inCloset;
+  p.hidden = p.inCloset || isHidingTile(level, p.x, p.y);
+  return true;
 }

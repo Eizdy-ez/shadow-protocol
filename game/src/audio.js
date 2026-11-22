@@ -1,123 +1,112 @@
-// SHADOW PROTOCOL — procedural sound, WebAudio only, no audio files.
-// Every sound is a short oscillator or filtered-noise envelope, built when
-// the AudioContext is first needed (after a user gesture).
+// SHADOW PROTOCOL — procedural WebAudio: every sound is synthesized, no files.
+export class SoundFX {
+  constructor() {
+    this.ctx = null;
+    this.master = null;
+    this.stepT = 0;
+  }
 
-let ctx = null;
-let muted = false;
-
-function ensure() {
-  if (!ctx) {
+  // Must be called from a user gesture at least once.
+  ensure() {
+    if (this.ctx) {
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+      return;
+    }
     try {
-      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.22;
+      this.master.connect(this.ctx.destination);
     } catch {
-      ctx = null;
+      this.ctx = null;
     }
   }
-  if (ctx && ctx.state === 'suspended') ctx.resume();
-  return ctx;
-}
 
-export function unlockAudio() {
-  ensure();
-}
+  tone(freq, dur, type = 'sine', vol = 0.5, slideTo = null, delay = 0) {
+    if (!this.ctx) return;
+    const t0 = this.ctx.currentTime + delay;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (slideTo !== null) osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + dur);
+    gain.gain.setValueAtTime(vol, t0);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(gain);
+    gain.connect(this.master);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  }
 
-export function toggleMute() {
-  muted = !muted;
-  return muted;
-}
+  noise(dur, vol = 0.4, freq = 1200, delay = 0) {
+    if (!this.ctx) return;
+    const t0 = this.ctx.currentTime + delay;
+    const len = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
+    const buffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = this.ctx.createBufferSource();
+    src.buffer = buffer;
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = freq;
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(vol, t0);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.master);
+    src.start(t0);
+  }
 
-export function isMuted() {
-  return muted;
-}
+  step(sneaking) {
+    if (!this.ctx) return;
+    this.tone(sneaking ? 140 : 90, 0.07, 'triangle', sneaking ? 0.1 : 0.22, 60);
+  }
 
-function tone(freq, dur, type = 'sine', gain = 0.12, slideTo = null, delay = 0) {
-  if (muted) return;
-  const ac = ensure();
-  if (!ac) return;
-  const t0 = ac.currentTime + delay;
-  const osc = ac.createOscillator();
-  const g = ac.createGain();
-  osc.type = type;
-  osc.frequency.setValueAtTime(freq, t0);
-  if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
-  g.gain.setValueAtTime(0, t0);
-  g.gain.linearRampToValueAtTime(gain, t0 + 0.01);
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-  osc.connect(g).connect(ac.destination);
-  osc.start(t0);
-  osc.stop(t0 + dur + 0.05);
-}
+  coin() {
+    this.tone(2100, 0.09, 'square', 0.16, 2600);
+    this.tone(2600, 0.12, 'square', 0.12, 3100, 0.05);
+  }
 
-function noiseBurst(dur, gain, freq = 800) {
-  if (muted) return;
-  const ac = ensure();
-  if (!ac) return;
-  const len = Math.floor(ac.sampleRate * dur);
-  const buf = ac.createBuffer(1, len, ac.sampleRate);
-  const data = buf.getChannelData(0);
-  for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
-  const src = ac.createBufferSource();
-  src.buffer = buf;
-  const filter = ac.createBiquadFilter();
-  filter.type = 'lowpass';
-  filter.frequency.value = freq;
-  const g = ac.createGain();
-  g.gain.value = gain;
-  src.connect(filter).connect(g).connect(ac.destination);
-  src.start();
-}
-
-export const sfx = {
-  step(run) {
-    noiseBurst(0.05, run ? 0.05 : 0.025, run ? 900 : 500);
-  },
-  guardStep(dist) {
-    // Quieter the farther the guard is.
-    const g = Math.max(0.01, 0.07 * (1 - dist / 260));
-    noiseBurst(0.06, g, 420);
-  },
-  pickup() {
-    tone(660, 0.09, 'sine', 0.12);
-    tone(990, 0.14, 'sine', 0.1, null, 0.08);
-  },
-  coinThrow() {
-    tone(1200, 0.12, 'sine', 0.08, 1800);
-  },
   coinLand() {
-    tone(2400, 0.05, 'triangle', 0.12);
-    tone(1800, 0.08, 'triangle', 0.1, null, 0.09);
-  },
+    this.tone(1500, 0.08, 'triangle', 0.2, 900);
+    this.noise(0.06, 0.15, 3000);
+  }
+
+  pickup() {
+    this.tone(660, 0.1, 'sine', 0.3);
+    this.tone(880, 0.12, 'sine', 0.3, null, 0.08);
+    this.tone(1320, 0.18, 'sine', 0.25, null, 0.16);
+  }
+
   sonar() {
-    tone(1400, 0.5, 'sine', 0.1, 320);
-    tone(1400, 0.4, 'sine', 0.06, 320, 0.14);
-  },
-  suspicious() {
-    tone(440, 0.16, 'triangle', 0.12, 520);
-  },
-  spotted() {
-    tone(220, 0.22, 'sawtooth', 0.14, 440);
-    tone(440, 0.22, 'sawtooth', 0.1, 660, 0.12);
-  },
-  cameraBeep() {
-    tone(1500, 0.06, 'square', 0.05);
-  },
-  alarm() {
-    tone(520, 0.3, 'sawtooth', 0.08, 380);
-  },
+    this.tone(1200, 0.5, 'sine', 0.3, 300);
+    this.tone(600, 0.4, 'sine', 0.15, 200, 0.1);
+  }
+
+  alert() {
+    this.tone(220, 0.25, 'sawtooth', 0.3, 440);
+    this.tone(440, 0.25, 'sawtooth', 0.25, 220, 0.18);
+  }
+
   bark() {
-    tone(180, 0.09, 'square', 0.14, 120);
-    tone(180, 0.09, 'square', 0.12, 110, 0.12);
-  },
+    this.noise(0.12, 0.5, 900);
+    this.noise(0.12, 0.45, 800, 0.16);
+  }
+
   caught() {
-    tone(160, 0.5, 'sawtooth', 0.16, 60);
-  },
-  hide() {
-    noiseBurst(0.18, 0.06, 300);
-  },
-  success() {
-    [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.22, 'sine', 0.12, null, i * 0.11));
-  },
+    this.tone(180, 0.5, 'sawtooth', 0.35, 60);
+    this.noise(0.4, 0.3, 400);
+  }
+
+  complete() {
+    [523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.22, 'sine', 0.3, null, i * 0.12));
+  }
+
   click() {
-    tone(800, 0.05, 'sine', 0.08);
-  },
-};
+    this.tone(900, 0.05, 'square', 0.12);
+  }
+}
